@@ -1,16 +1,15 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-import openai
+import google.generativeai as genai
 import os
 import json
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# New OpenAI client setup (v1.x)
-from openai import OpenAI
-
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Configure Gemini API
+genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
+model = genai.GenerativeModel('gemini-pro')
 
 app = FastAPI()
 
@@ -48,13 +47,14 @@ Return the output in this JSON format:
 """
 
     try:
-        response = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            messages=[{"role": "user", "content": prompt}],
-            temperature=0.7,
-            max_tokens=1000
+        response = model.generate_content(
+            prompt,
+            generation_config=genai.types.GenerationConfig(
+                temperature=0.7,
+                max_output_tokens=1000,
+            )
         )
-        result = response.choices[0].message.content
+        result = response.text
         return json.loads(result)
     except Exception as e:
         return {"error": str(e)}
