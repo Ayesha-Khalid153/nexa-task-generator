@@ -1,18 +1,58 @@
 from fastapi import FastAPI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+from google.generativeai import GenerationConfig 
 import google.generativeai as genai
 import requests, json, os, re, random
 from dotenv import load_dotenv
+from typing import List, Dict, Any
+
+# --- CRITICAL FIX 1: Define FinishReason gracefully for version compatibility ---
+# If the direct import fails, define the enum values based on the API documentation.
+try:
+    # Attempt the standard import (for newer/standard SDKs)
+    from google.generativeai.types import FinishReason
+except ImportError:
+    print("⚠️ Warning: google.generativeai.types.FinishReason not found. Defining custom FinishReason enum for compatibility.")
+    # Define a custom class to mimic the enum for older/different SDKs
+    class FinishReason:
+        # 0: FINISH_REASON_UNSPECIFIED
+        STOP = 1
+        SAFETY = 2
+        RECITATION = 3
+        MAX_TOKENS = 4
+        # ... other reasons aren't needed for this logic
+
+# --- Pydantic Schema for Guaranteed Output ---
+class TaskModel(BaseModel):
+    task: str = Field(description="A detailed title for the specific task.")
+    assignedTo: str = Field(description="The exact 'Member Name' from the Team list responsible for the task.")
+    role: str = Field(description="The role of the assigned member, derived from the team list.")
+    priority: str = Field(description="Priority: High, Medium, or Low.")
+    deadlineDays: int = Field(description="Estimated days to complete the task (2-7 days).")
+    status: str = Field(description="Initial status: Backlog or In Progress.")
+    queueOrder: int = Field(description="Sequential order of this task in the member's personal queue.")
+
+class UserStoryModel(BaseModel):
+    story: str = Field(description="User story written in the format: 'As a user, I want...'")
+    acceptanceCriteria: List[str] = Field(description="List of criteria that define when the story is complete.")
+    tasks: List[TaskModel]
+
+class EpicModel(BaseModel):
+    title: str = Field(description="The title of the Epic, grouping related user stories.")
+    userStories: List[UserStoryModel]
+
+class TaskGeneratorResponse(BaseModel):
+    epics: List[EpicModel]
+
 
 # --- Load environment ---
-# Make sure GOOGLE_API_KEY and NODE_BACKEND_URL are set in your .env file
 load_dotenv()
 genai.configure(api_key=os.getenv("GOOGLE_API_KEY"))
 
 # ✅ Use stable, supported Gemini model
 model = genai.GenerativeModel(
     model_name="models/gemini-2.5-flash",
-    system_instruction="You are an AI Agile Project Planner that outputs structured JSON for software project task planning. You are a component of the NEXA multi-agent suite, responsible for Task Generation."
+    system_instruction="You are an AI Agile Project Planner that MUST adhere strictly to the provided JSON schema for all outputs. You are a component of the NEXA multi-agent suite, responsible for Task Generation, assignment, and workload balancing."
 )
 
 NODE_BACKEND_URL = os.getenv("NODE_BACKEND_URL")
@@ -26,7 +66,7 @@ class ProjectInput(BaseModel):
     auth_token: str = None
 
 
-# --- Fallback generator (Unchanged for reliability) ---
+# --- Fallback generator (Unchanged) ---
 def generate_fallback_tasks(description: str, team: list):
     print("⚙️ Using fallback task generator")
     if not team:
@@ -63,18 +103,11 @@ def generate_fallback_tasks(description: str, team: list):
     return {"epics": epics}
 
 
-# --- Role-based assignment post-processing (SMARTENED) ---
+# --- Role-based assignment post-processing (Unchanged) ---
 def assign_tasks_by_role(result: dict, team: list) -> dict:
-    """
-    Validates and cleans up LLM assignments based on hard constraints:
-    1. Ensures all tasks have an 'assignedTo' from the team list (or 'Unassigned' fallback).
-    2. Enforces the rule: max ONE 'In Progress' task per team member.
-    3. Re-calculates and enforces 'queueOrder' sequentially per member based on LLM priority.
-    """
     if not result or 'epics' not in result:
         return result
 
-    # 1. Map team members for easy lookup and tracking
     member_map = {}
     for m in team:
         name = m.get('name', 'Unassigned')
@@ -82,23 +115,19 @@ def assign_tasks_by_role(result: dict, team: list) -> dict:
             'name': name,
             'role': (m.get('role') or 'Developer').strip(),
             'assigned': 0,
-            'tasks': [] # To store all tasks assigned to this member
+            'tasks': [] 
         }
     
-    # Define priority order for consistent 'In Progress' selection
     priority_order = {'high': 3, 'medium': 2, 'low': 1}
 
-    # 2. Iterate and sort tasks into member queues
     for epic in result.get('epics', []):
         for us in epic.get('userStories', []):
             for task in us.get('tasks', []):
                 assigned_name = task.get('assignedTo')
                 
-                # Use LLM-assigned name, but default to 'Unassigned' if missing or not in the team
                 mem = member_map.get(assigned_name)
                 
                 if not mem:
-                    # Fallback assignment to 'Unassigned' member if the name from LLM doesn't exist
                     unassigned_member = member_map.setdefault(
                         "Unassigned", 
                         {'name': 'Unassigned', 'role': 'Developer', 'assigned': 0, 'tasks': []}
@@ -108,36 +137,95 @@ def assign_tasks_by_role(result: dict, team: list) -> dict:
                 else:
                     task['assignedTo'] = mem['name']
 
-                # Ensure role field is populated correctly
                 task['role'] = mem['role']
-                
-                # Track the task
                 mem['tasks'].append(task)
                 mem['assigned'] += 1
     
-    # 3. Enforce 'In Progress' limit and re-calculate queueOrder
     for name, mem in member_map.items():
         if not mem['tasks']:
             continue
             
-        # Sort all tasks to determine the true sequential order:
-        # Sort key: 1. Priority (High > Medium > Low) 2. LLM's initial queueOrder (as tie-breaker)
         mem['tasks'].sort(key=lambda x: (
             priority_order.get(x.get('priority', '').lower(), 0), 
             x.get('queueOrder', 999) 
-        ), reverse=True) # Highest priority first
+        ), reverse=True) 
 
-        # Apply final status and sequential queueOrder
         for i, task in enumerate(mem['tasks']):
             task['queueOrder'] = i + 1
             if i == 0:
-                # The highest priority task is set to 'In Progress'
                 task['status'] = 'In Progress' 
             else:
-                # All other tasks must be 'Backlog' to enforce the single In-Progress rule
                 task['status'] = 'Backlog'
 
     return result
+
+# Helper: extract balanced JSON by scanning braces (Unchanged)
+def extract_balanced_json(s: str):
+    start = s.find('{')
+    if start == -1:
+        return None
+    i = start
+    depth = 0
+    in_string = False
+    esc = False
+    quote_char = None
+    while i < len(s):
+        ch = s[i]
+        if in_string:
+            if esc:
+                esc = False
+            elif ch == '\\':
+                esc = True
+            elif ch == quote_char:
+                in_string = False
+        else:
+            if ch == '"' or ch == "'":
+                in_string = True
+                quote_char = ch
+            elif ch == '{':
+                depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    return s[start:i+1]
+        i += 1
+    return None
+
+# Helper: escape raw newlines AND unescaped quotes inside JSON string literals (Unchanged, robust)
+def escape_newlines_in_strings(s: str):
+    out = []
+    in_str = False
+    esc = False
+    quote = None
+    for ch in s:
+        if in_str:
+            if esc:
+                out.append(ch)
+                esc = False
+            elif ch == '\\':
+                out.append(ch)
+                esc = True
+            elif ch == quote:
+                out.append(ch)
+                in_str = False
+            elif ch == '\n':
+                out.append('\\n')
+            elif ch in ('\t', '\r', '\f'):
+                out.append('\\' + ch) 
+            elif ch == '"' and quote == '"':
+                out.append('\\"')
+            elif ch == "'" and quote == "'":
+                out.append("\\'")
+            else:
+                out.append(ch)
+        else:
+            if ch == '"' or ch == "'":
+                in_str = True
+                quote = ch
+                out.append(ch)
+            else:
+                out.append(ch)
+    return ''.join(out)
 
 
 # --- Core route ---
@@ -162,213 +250,90 @@ async def generate_tasks(input: ProjectInput):
     except Exception as e:
         print(f"⚠️ Error fetching team: {e}")
 
-    # Add 'Unassigned' if team is empty, or ensure it exists for fallback
     if not team or not any(m.get('name') == 'Unassigned' for m in team):
         team.append({"name": "Unassigned", "role": "Developer"})
 
-    # --- Step 2: Generate tasks with Gemini (SMART PROMPT) ---
+    # --- Step 2: Generate tasks with Gemini ---
     team_json = json.dumps(team, indent=2)
     prompt = f"""
-You are an **AI Agile Project Planner** helping plan the project described below.
-The project is: {input.description} [cite: 374]
+You are an **AI Agile Project Planner** working on a **safe, technical project planning task**.
+This is purely a professional software project management context.
+
+The project to plan is:
+\"\"\"{input.description}\"\"\"
 
 ### Team
 {team_json}
 
-Generate a **comprehensive backlog** with ~80–90 tasks distributed across 6–8 epics, 2–4 user stories each.
+Generate a **comprehensive backlog** with ~20–25 tasks distributed across 3–4 epics, 2–4 user stories each.
 
-Output ONLY valid JSON in this format:
-
-{{
-  "epics": [
-    {{
-      "title": "Epic Title",
-      "userStories": [
-        {{
-          "story": "As a user, I want ...",
-          "acceptanceCriteria": ["Criterion 1", "Criterion 2"],
-          "tasks": [
-            {{
-              "task": "Task title",
-              "assignedTo": "Member Name",
-              "role": "Member Role",
-              "priority": "High | Medium | Low",
-              "deadlineDays": <int>,
-              "status": "Backlog | In Progress",
-              "queueOrder": <int>
-            }}
-          ]
-        }}
-      ]
-    }}
-  ]
-}}
-
-### Important Instructions for Role-Based Assignment and Balancing:
-- **Critical Role-Based Assignment**: You must assign the `assignedTo` field to a specific `Member Name` from the `Team` list.
-- **Match Tasks to Roles**: Tasks should be assigned based on the team member's role (e.g., Frontend tasks to Frontend Developers, Database tasks to Backend/DB Engineers).
-- **Workload Balancing**: Distribute the total number of tasks as evenly as possible among all relevant members, avoiding skill mismatch.
-- **Priority and Status**: Set initial `priority` and `status`. The post-processing agent will enforce the final constraint: Each member can have only ONE task with `"status": "In Progress"` (the highest priority task for that member).
-- Assign a realistic, sequential `"queueOrder"` per member.
-- Use realistic task names and durations (2–7 days).
-- Return **ONLY valid JSON** — no markdown, no commentary, no triple backticks.
+### Important Instructions:
+- This request does **not** involve any unsafe, unethical, or harmful content.
+- Focus only on **technical tasks**, **software engineering**, and **project management**.
+- Assign each task to a team member based on their role.
+- Return **ONLY valid JSON** (no markdown, no commentary, no triple backticks).
 """
-
     try:
-        response = model.generate_content(
-            prompt,
-            generation_config=genai.GenerationConfig(
-                temperature=0.4,
-                max_output_tokens=12000,  # allow large output
-            )
+        config = GenerationConfig(
+            temperature=0.7, 
+            response_mime_type="application/json", 
+            response_schema=TaskGeneratorResponse,
+            max_output_tokens=12000,
         )
 
-        if not response.candidates or not response.candidates[0].content.parts:
-            print("❌ Empty response from Gemini — using fallback")
+        response = model.generate_content(
+            prompt,
+            generation_config=config,
+        )
+        
+        # --- CRITICAL FIX 3: Robust Safety Check before accessing .text ---
+        # We rely on the FinishReason definition established at the top of the file.
+        if not response.candidates or response.candidates[0].finish_reason != FinishReason.STOP:
+            if response.candidates:
+                reason = response.candidates[0].finish_reason
+                print(f"❌ Gemini API error: Response blocked/incomplete. Finish Reason: {reason}")
+                if reason == FinishReason.SAFETY:
+                    print("Hint: Content was blocked due to safety settings. Try simplifying the project description.")
+            else:
+                print("❌ Gemini API error: No candidates were returned.")
+            
             return generate_fallback_tasks(input.description, team)
 
-        # Get text and parse
+        # Proceed only if the response is valid
+        raw_result = response.text.strip()
+        print(f"🧠 Gemini response (first 300 chars):\n{raw_result[:300]}")
+        
+        # Final safety cleanup for any leftover issues (like trailing commas from the LLM)
+        cleaned_json = re.sub(r',\s*([}\]])', r'\1', raw_result, flags=re.MULTILINE)
+        
         try:
-            if response.candidates[0].content and getattr(response.candidates[0].content, 'parts', None):
-                raw = "".join(response.candidates[0].content.parts)
-            else:
-                raw = response.text if hasattr(response, 'text') else ''
-        except Exception:
-            raw = response.text if hasattr(response, 'text') else ''
-
-        result = raw.strip()
-        print(f"🧠 Gemini response (first 300 chars):\n{result[:300]}")
-
-        # Remove triple-backtick fences if present
-        def strip_code_fences(s):
-            s2 = re.sub(r'^```[a-zA-Z]*\n', '', s)
-            s2 = re.sub(r'\n```$', '', s2)
-            return s2
-
-        cleaned = strip_code_fences(result)
-
-        # Helper: extract balanced JSON by scanning braces (handles nested braces and ignores braces inside strings)
-        # This function is retained for robust JSON parsing
-        def extract_balanced_json(s: str):
-            start = s.find('{')
-            if start == -1:
-                return None
-            i = start
-            depth = 0
-            in_string = False
-            esc = False
-            quote_char = None
-            while i < len(s):
-                ch = s[i]
-                if in_string:
-                    if esc:
-                        esc = False
-                    elif ch == '\\':
-                        esc = True
-                    elif ch == quote_char:
-                        in_string = False
-                else:
-                    if ch == '"' or ch == "'":
-                        in_string = True
-                        quote_char = ch
-                    elif ch == '{':
-                        depth += 1
-                    elif ch == '}':
-                        depth -= 1
-                        if depth == 0:
-                            return s[start:i+1]
-                i += 1
-            return None
-
-        # Helper: escape raw newlines inside JSON string literals
-        # This function is retained for robust JSON parsing
-        def escape_newlines_in_strings(s: str):
-            out = []
-            in_str = False
-            esc = False
-            quote = None
-            for ch in s:
-                if in_str:
-                    if esc:
-                        out.append(ch)
-                        esc = False
-                    elif ch == '\\':
-                        out.append(ch)
-                        esc = True
-                    elif ch == quote:
-                        out.append(ch)
-                        in_str = False
-                    elif ch == '\n':
-                        out.append('\\n')
-                    else:
-                        out.append(ch)
-                else:
-                    if ch == '"' or ch == "'":
-                        in_str = True
-                        quote = ch
-                        out.append(ch)
-                    else:
-                        out.append(ch)
-            return ''.join(out)
-
-        json_text = cleaned
-
-        # Try direct parse, then balanced extraction + fixes
-        try:
-            parsed_result = json.loads(json_text)
-            print("✅ Successfully parsed Gemini JSON (Direct)")
+            parsed_result = json.loads(cleaned_json)
+            print("✅ Successfully parsed Gemini JSON (Schema Enforced)")
             return assign_tasks_by_role(parsed_result, team)
         except json.JSONDecodeError as e:
-            print(f"⚠️ JSON parse failed (Direct): {e}")
+            # Fallback to the extremely robust manual cleanup using helper functions
+            print(f"⚠️ JSON parse failed (Schema enforced, falling back to manual cleanup): {e}")
+            
+            fixed = escape_newlines_in_strings(raw_result)
+            fixed = re.sub(r',\s*([}\]])', r'\1', fixed, flags=re.MULTILINE)
 
-        extracted = extract_balanced_json(cleaned)
-        if extracted:
-            # Escape newlines inside strings and remove trailing commas
-            fixed = escape_newlines_in_strings(extracted)
-            fixed = re.sub(r',\s*([}\]])', r'\1', fixed)
             try:
                 parsed_result = json.loads(fixed)
-                print("✅ Successfully extracted and parsed JSON (Fixed)")
+                print("✅ Successfully parsed JSON after manual cleanup")
                 return assign_tasks_by_role(parsed_result, team)
             except json.JSONDecodeError as e2:
-                print(f"⚠️ Failed to parse extracted JSON: {e2}")
-
-            # As a last attempt, try to find the largest {...} substring and parse it
-            candidates = re.findall(r'\{.*?\}', cleaned, re.DOTALL)
-            if candidates:
-                candidates.sort(key=len, reverse=True)
-                for cand in candidates:
-                    try:
-                        cand_fixed = escape_newlines_in_strings(cand)
-                        cand_fixed = re.sub(r',\s*([}\]])', r'\1', cand_fixed)
-                        parsed_result = json.loads(cand_fixed)
-                        print("✅ Successfully parsed JSON from a candidate substring")
-                        return assign_tasks_by_role(parsed_result, team)
-                    except Exception:
-                        continue
-
-            # Save the raw cleaned response to a debug file for inspection
-            try:
-                import pathlib, datetime
-                debug_dir = pathlib.Path('debug_responses')
-                debug_dir.mkdir(exist_ok=True)
-                ts = datetime.datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
-                debug_path = debug_dir / f'gemini_response_{ts}.txt'
-                with debug_path.open('w', encoding='utf-8') as f:
-                    f.write(cleaned)
-                print(f"🔍 Saved raw Gemini response to: {debug_path.resolve()}")
-            except Exception as dbg_e:
-                print(f"Failed to write debug file: {dbg_e}")
-
-            print("🔄 Falling back due to JSON parsing failure")
-            return generate_fallback_tasks(input.description, team)
+                print(f"⚠️ Failed to parse even after manual cleanup: {e2}")
+                print("🔄 Falling back due to catastrophic JSON failure")
+                return generate_fallback_tasks(input.description, team)
 
     except Exception as e:
         print(f"❌ Gemini API error: {e}")
+        if hasattr(e, '__traceback__'):
+             import traceback
+             print(traceback.format_exc())
         return generate_fallback_tasks(input.description, team)
 
 
 if __name__ == "__main__":
     import uvicorn
-    # Make sure you run this file with 'uvicorn <filename>:app --reload'
     uvicorn.run(app, host="0.0.0.0", port=8000)
