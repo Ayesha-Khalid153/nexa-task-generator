@@ -1,0 +1,19 @@
+{
+  "parsed": {
+    "title": "Configure basic CI/CD pipeline using GitHub Actions for MERN stack",
+    "priority": "High",
+    "role": "Devops Engineer",
+    "complexity": "Medium",
+    "type": "DevOps",
+    "riskLevel": "Medium",
+    "definitionOfDone": "Pipeline passes initial build and linting checks for both frontend and backend repositories.",
+    "tags": [
+      "CI/CD",
+      "automation",
+      "DevOps"
+    ],
+    "potentialBlockers": [
+      "Build scripts not finalized for specific environments"
+    ]
+  }
+}
