@@ -1,5 +1,6 @@
 import os
 import json
+import time
 import random
 import re
 import traceback
@@ -23,14 +24,20 @@ load_dotenv()
 
 # --- Configuration / Tuning ---
 NODE_BACKEND_URL = os.getenv("NODE_BACKEND_URL", "http://localhost:5000")
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DEFAULT_TASK_COUNT = int(os.getenv("DEFAULT_TASK_COUNT", "20"))
 DEFAULT_MAX_OUTPUT_TASKS = 60
 RANDOM_SEED = int(os.getenv("TASK_GEN_SEED", "42"))
+GEMINI_RETRY_COUNT = int(os.getenv("GEMINI_RETRY_COUNT", "3"))
+GEMINI_BACKOFF_BASE = float(os.getenv("GEMINI_BACKOFF_BASE", "2.0"))  # Increased backoff
+GEMINI_TIMEOUT = int(os.getenv("GEMINI_TIMEOUT", "120"))  # Increased timeout
 
 # If genai available, configure
-if GENAI_OK and GOOGLE_API_KEY:
-    pass
+if GENAI_OK and GEMINI_API_KEY:
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+    except Exception as e:
+        print(f"⚠️ Failed to configure Gemini: {e}")
 
 app = FastAPI(title="NEXA Task Generator Agent (Upgraded)")
 
@@ -350,55 +357,76 @@ BACKLOG_RESPONSE_SCHEMA = {
 }
 
 # -------------------------
-# Main generation function
+# Main generation function - UPDATED WITH OFFICIAL LIBRARY
 # -------------------------
 async def generate_with_gemini(prompt: str) -> Optional[Dict[str,Any]]:
-    """Call gemini safely (if available) and return parsed JSON or None."""
+    """Call gemini using official Google library with better error handling."""
     if not GENAI_OK:
         print(timestamp_log("⚠️ google.generativeai library not available; Gemini disabled."))
         return None
-    if not GOOGLE_API_KEY:
-        print(timestamp_log("⚠️ GOOGLE_API_KEY is not set; Gemini calls will be skipped."))
+    if not GEMINI_API_KEY:
+        print(timestamp_log("⚠️ GEMINI_API_KEY is not set; Gemini calls will be skipped."))
         return None
-        
+
+    # Validate API key
+    if not GEMINI_API_KEY or GEMINI_API_KEY.strip() == "":
+        print(timestamp_log("❌ GEMINI_API_KEY is not set in environment variables"))
+        return None
+
     try:
-        import requests 
+        # Configure the official library
+        genai.configure(api_key=GEMINI_API_KEY)
         
-        config_dict = {
-            "temperature": 0.6, 
-            "responseMimeType": "application/json", 
-            "maxOutputTokens": 8000,
-            "responseSchema": BACKLOG_RESPONSE_SCHEMA
-        }
+        # Use stable model instead of preview
+        model = genai.GenerativeModel('models/gemini-2.0-flash')
         
-        model_name = "gemini-2.5-flash-preview-09-2025"
-        # Correct API URL construction
-        api_url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={GOOGLE_API_KEY}"
+        generation_config = GenerationConfig(
+            temperature=0.6,
+            max_output_tokens=8000,
+            response_mime_type="application/json",
+        )
         
-        payload = {
-            "contents": [{ "parts": [{ "text": prompt }] }],
-            "generationConfig": config_dict
-        }
+        # Build the prompt with schema instructions
+        structured_prompt = f"""
+        {prompt}
         
-        headers = {'Content-Type': 'application/json'}
+        You MUST respond with valid JSON that matches this exact schema:
+        {json.dumps(BACKLOG_RESPONSE_SCHEMA, indent=2)}
+        
+        Return ONLY the JSON object, no other text or markdown formatting.
+        """
+        
+        print(timestamp_log("🔧 Attempting Gemini API call with official library..."))
         
         response = await asyncio.to_thread(
-            lambda: requests.post(api_url, headers=headers, data=json.dumps(payload), timeout=90)
+            lambda: model.generate_content(
+                structured_prompt,
+                generation_config=generation_config
+            )
         )
-        response.raise_for_status()
         
-        result = response.json()
-        raw_text = result.get('candidates', [{}])[0].get('content', {}).get('parts', [{}])[0].get('text', "")
-        
-        # FIX: Simple parsing now that structured output is enforced
-        parsed = simple_json_load(raw_text) 
-        
-        return parsed
-
+        if response.text:
+            parsed = simple_json_load(response.text)
+            if parsed:
+                print(timestamp_log("✅ Gemini API call successful"))
+                return parsed
+            else:
+                print(timestamp_log("⚠️ Failed to parse Gemini response as JSON"))
+                # Save for debugging
+                try:
+                    os.makedirs('debug_responses', exist_ok=True)
+                    ts = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+                    debug_path = os.path.join('debug_responses', f'gemini_parse_fail_{ts}.txt')
+                    with open(debug_path, 'w', encoding='utf-8') as f:
+                        f.write(response.text)
+                    print(timestamp_log(f"💾 Saved unparseable response to {debug_path}"))
+                except Exception:
+                    pass
+                
     except Exception as e:
-        print(timestamp_log(f"❌ Gemini call failed: {str(e)}"))
-        print(traceback.format_exc())
-        return None
+        print(timestamp_log(f"❌ Gemini API error: {str(e)}"))
+        
+    return None
 
 # -------------------------
 # Fallback content generator (heuristic)
@@ -743,7 +771,22 @@ async def generate_tasks(input: ProjectInput):
 
     return response
 
+# Test endpoint for Gemini connectivity
+@app.get("/test-gemini")
+async def test_gemini():
+    """Test if Gemini API is working."""
+    if not GENAI_OK or not GEMINI_API_KEY:
+        return {"success": False, "error": "Gemini not configured"}
+    
+    try:
+        genai.configure(api_key=GEMINI_API_KEY)
+        model = genai.GenerativeModel('models/gemini-2.0-flash')
+        response = model.generate_content("Say 'Hello World' in JSON format: {'message': 'Hello World'}")
+        return {"success": True, "response": response.text}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
 # If run standalone
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", 8000)), log_level="info")
