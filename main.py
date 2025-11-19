@@ -755,6 +755,15 @@ async def generate_tasks(input: ProjectInput):
         print(timestamp_log("⚠️ Gemini result missing or invalid – using fallback heuristic generator."))
         phases_struct = fallback_generate(config, team_members, rnd)
 
+    # Ensure each phase has a description (LLM may omit it) — minimal safe post-processing
+    for phase in phases_struct.get("phases", []):
+        if not phase.get("description"):
+            try:
+                epic_titles = ', '.join(e.get('title', '') for e in (phase.get('epics') or [])[:3])
+                phase["description"] = f"Work for {phase.get('title', 'Phase')}. Key areas: {epic_titles}." if epic_titles else f"Work for {phase.get('title', 'Phase')}."
+            except Exception:
+                phase["description"] = f"Work for {phase.get('title', 'Phase')}."
+
     # 3. Post process, flatten, assign SUGGESTIONS
     meta = flatten_and_assign(phases_struct, team_members, input.options, rnd, config)
     
