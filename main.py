@@ -497,7 +497,13 @@ def fallback_generate(config: ProjectConfigInput, team: List[TeamMemberInput], r
                 userStories.append({"story": story, "acceptanceCriteria": ["Implemented", "Reviewed"], "tasks": tasks})
             epics.append({"title": epic_title, "userStories": userStories})
         if epics:
-            result_phases.append({"title": phase_title, "epics": epics})
+            # Add a short description for the phase to improve downstream display
+            try:
+                modules_preview = ', '.join(str(x) for x in (module_list if module_list else [])[:3])
+                phase_description = f"Work for {phase_title}. Key areas: {modules_preview}."
+            except Exception:
+                phase_description = f"Work for {phase_title}."
+            result_phases.append({"title": phase_title, "description": phase_description, "epics": epics})
 
     return {"phases": result_phases}
 
@@ -679,7 +685,6 @@ async def generate_tasks(input: ProjectInput):
                 try:
                     # If the model returned a single Task-like dict, wrap it into phases->epics->userStories->tasks
                     if isinstance(llm_result, dict):
-                        # heuristic: look for task-like keys
                         task_like_keys = {"title", "priority", "role"}
                         if task_like_keys.intersection(set(llm_result.keys())):
                             task_obj = llm_result.copy()
@@ -689,12 +694,13 @@ async def generate_tasks(input: ProjectInput):
                                 "phases": [
                                     {
                                         "title": "Auto-generated Phase",
+                                        "description": "Auto-generated phase covering the wrapped single task.",
                                         "epics": [
                                             {
                                                 "title": "Auto-generated Epic",
                                                 "userStories": [
                                                     {
-                                                        "story": task_obj.get("story", "Auto-generated story"),
+                                                        "story": "Auto-generated story",
                                                         "acceptanceCriteria": [],
                                                         "tasks": [task_obj]
                                                     }
@@ -704,10 +710,9 @@ async def generate_tasks(input: ProjectInput):
                                     }
                                 ]
                             }
-                            print(timestamp_log("ℹ️ Gemini returned a single task object — wrapping into phases/epic/story."))
-                    # If it is a list of tasks, wrap similarly
+
+                    # If the model returned a flat list of Task-like dicts, wrap them as tasks
                     if coerced is None and isinstance(llm_result, list) and llm_result:
-                        # check first element for task-like shape
                         first = llm_result[0]
                         if isinstance(first, dict) and {"title", "priority"}.intersection(set(first.keys())):
                             tasks = []
@@ -720,6 +725,7 @@ async def generate_tasks(input: ProjectInput):
                                 "phases": [
                                     {
                                         "title": "Auto-generated Phase",
+                                        "description": "Auto-generated phase covering the wrapped tasks.",
                                         "epics": [
                                             {
                                                 "title": "Auto-generated Epic",
