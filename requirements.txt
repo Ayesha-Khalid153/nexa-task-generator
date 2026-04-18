@@ -2,3 +2,5 @@ fastapi
 uvicorn
 google-generativeai
 python-dotenv
+httpx
+mcp>=1.0.0
