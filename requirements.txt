@@ -3,4 +3,4 @@ uvicorn
 google-generativeai
 python-dotenv
 httpx
-mcp>=1.0.0
+mcp>=1.0.0,<1.20.0

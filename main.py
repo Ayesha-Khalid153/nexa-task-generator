@@ -44,7 +44,15 @@ app = FastAPI(title="NEXA Task Generator Agent (Upgraded)")
 # Mount MCP server (Streamable HTTP at /mcp) — import done here, after app creation,
 # to avoid circular-import issues (mcp_server.py lazy-imports from this module).
 from mcp_server import mcp as _mcp_server  # noqa: E402
-app.mount("/mcp", _mcp_server.get_asgi_app())
+try:
+    if hasattr(_mcp_server, 'get_asgi_app'):
+        app.mount("/mcp", _mcp_server.get_asgi_app())
+    elif hasattr(_mcp_server, 'asgi_app'):
+        app.mount("/mcp", _mcp_server.asgi_app)
+    else:
+        print("[WARN] MCP server could not be mounted — REST endpoints will still work")
+except Exception as e:
+    print(f"[WARN] MCP mount failed ({e}) — REST endpoints will still work")
 
 # -------------------------
 # Pydantic Input / Output
