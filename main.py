@@ -22,7 +22,6 @@ except Exception:
 
 load_dotenv()
 
-# --- Configuration / Tuning ---
 NODE_BACKEND_URL = os.getenv("NODE_BACKEND_URL", "http://localhost:5000")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 DEFAULT_TASK_COUNT = int(os.getenv("DEFAULT_TASK_COUNT", "20"))
